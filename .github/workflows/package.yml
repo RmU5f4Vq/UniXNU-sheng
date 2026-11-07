@@ -1,82 +1,164 @@
-#!/usr/bin/env bash
-# Device packaging script, identical in every device repository. Do not edit it: a board changes board.toml
-# ([package] and the sections it names), never this file. Steps (run by "unixnu release"): deps, preflight,
-# patches, build, pack, verify. Documentation: docs/porting/packaging.md in the UniXNU repository.
-# usage: scripts/package.sh [--os 17|26|27|PROFILE] [--no-deps] [--check] [any other unixnu option]
-#
-# Local deviation (see "fix_mesa_patches" below): the pinned UniXNU revision ships a malformed Mesa patch,
-# patches/mesa/turnip-frame-diagnostics.patch. Its new-file section carries "diff --git ..." and
-# "--- /dev/null" but no "new file mode", so "git apply" treats it as a rename of dev/null and fails with
-#   error: dev/null: No such file or directory
-# upstream in build-boot-runtime.py. The file is repaired in the UniXNU working tree before "unixnu release"
-# runs. The repair is idempotent, costs nothing when the patch is already correct, and is harmless when the
-# patch, the profile or the patch list is absent. Delete this block once upstream ships the fix.
-set -euo pipefail
-DEVICE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-UNIXNU=$(python3 - "$DEVICE/board.toml" <<'PY'
-import sys, tomllib
-package = tomllib.load(open(sys.argv[1], 'rb')).get('package', {})
-if 'unixnu' not in package:
-    sys.exit('board.toml needs [package] unixnu = "<path of the UniXNU checkout, relative to this repository>"')
-print(package['unixnu'])
-PY
-)
-case "$UNIXNU" in /*) ROOT=$UNIXNU ;; *) ROOT=$(cd "$DEVICE/$UNIXNU" && pwd) ;; esac
+name: package
 
-# Repair Mesa patches that create files without a "new file mode" header. git apply misreads such a section
-# as a rename of dev/null; the same defect also makes the reverse-applied patch-identity check pass silently,
-# so it only surfaces as a build failure. Runs before "unixnu release" because the build applies these patches
-# from the UniXNU checkout (tree/patches is a symlink into it). Never fails a build: an unexpected error here
-# leaves the source untouched and lets the build report the defect itself.
-fix_mesa_patches() {
-    python3 - "$ROOT" <<'PY'
-import sys, pathlib
+# scripts/package.sh of this repository on a macOS runner, with the UniXNU and uefi-sheng
+# checkouts beside it, the layout board.toml names. The platform seed comes from the
+# repository secret UNIXNU_UNIQUE_CHIP_ID and is baked into the images, so the run's
+# artifacts belong to one device alone: download them, then delete the run.
 
-root = pathlib.Path(sys.argv[1])
-targets = sorted(root.glob('patches/mesa/*.patch'))
-# A previous failed run can leave an assembled tree behind; repair its copies too.
-targets += sorted(root.glob('out/*/*/*/tree/patches/mesa/*.patch'))
-repaired = []
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "OS profile of the images"
+        type: choice
+        options: ["27", "26", "17"]
+        default: "27"
+      init_data:
+        description: "Create a NEW installation seed if no saved seed exists (iPadOS 27 only)"
+        type: boolean
+        default: false
+      data_seed_url:
+        description: "Optional original data.dbr URL for an existing installation; otherwise use the saved cache"
+        type: string
+      data_seed_sha256:
+        description: "Required SHA-256 when data_seed_url is supplied"
+        type: string
 
-for path in targets:
-    try:
-        text = path.read_text()
-    except (OSError, UnicodeDecodeError):
-        continue
-    # A file can mix repaired and unrepaired sections, so decide per section below. This only skips files
-    # that create nothing.
-    if '--- /dev/null' not in text:
-        continue
+permissions:
+  contents: read
 
-    lines = text.splitlines(keepends=True)
-    out = []
-    changed = False
-    for index, line in enumerate(lines):
-        out.append(line)
-        if not line.startswith('diff --git '):
-            continue
-        # Collect the extended header lines that follow "diff --git" and precede the first hunk.
-        header = []
-        probe = index + 1
-        while probe < len(lines) and not lines[probe].startswith('@@'):
-            header.append(lines[probe])
-            probe += 1
-        creates = any(item.startswith('--- /dev/null') for item in header)
-        declares = any(item.startswith('new file mode') for item in header)
-        if creates and not declares:
-            out.append('new file mode 100644\n')
-            changed = True
-    if changed:
-        try:
-            path.write_text(''.join(out))
-        except OSError:
-            continue
-        repaired.append(str(path))
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
 
-if repaired:
-    print('package.sh: repaired Mesa patch header in ' + ', '.join(repaired), file=sys.stderr)
-PY
-}
-fix_mesa_patches || true
-
-exec python3 "$ROOT/unixnu" release -D "$DEVICE" "$@"
+jobs:
+  package:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: 82b847c4ac3f68a57024b3082ffa3a03442defd9 # Wi-Fi runtime and Data firmware integration
+          path: UniXNU
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/uefi-sheng
+          path: uefi-sheng
+          submodules: recursive
+      - name: tools
+        run: |
+          brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup blacktop/tap/ipsw
+          {
+            echo "$HOME/.cargo/bin"
+            echo "/opt/homebrew/opt/llvm/bin"
+            echo "/opt/homebrew/opt/lld/bin"
+            echo "/opt/homebrew/opt/bison/bin"
+          } >> "$GITHUB_PATH"
+          rustup toolchain install 1.98.0 --profile minimal --component rust-src
+          # Fail fast, naming the tool, before forty minutes of build.
+          ok=1
+          for t in clang xcodebuild make git ninja cmake dtc fdtget fdtput aea compression_tool \
+                   mformat mcopy ipsw; do
+            command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
+          done
+          for t in lld-link llvm-lib llvm-rc llvm-nm llvm-objcopy; do
+            [ -f "/opt/homebrew/opt/llvm/bin/$t" ] || [ -f "/opt/homebrew/opt/lld/bin/$t" ] || { echo "missing tool: $t"; ok=0; }
+          done
+          [ "$ok" = 1 ]
+      - name: platform seed
+        env:
+          seed: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          if ! [[ "$seed" =~ ^[0-9a-fA-F]{8}$ ]]; then
+            echo 'Set the repository secret UNIXNU_UNIQUE_CHIP_ID: the platform seed of the device, 8 hex digits.' >&2
+            exit 1
+          fi
+      - name: seed cache identity
+        id: seed-key
+        env:
+          SEED: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('key=data-seed-v1-' + hashlib.sha256(os.environ['SEED'].encode()).hexdigest()[:16] + '\n')
+          PY
+      - uses: actions/cache/restore@v4
+        id: data-cache
+        if: inputs.os == '27'
+        with:
+          path: |
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/inputs.json
+          key: ${{ steps.seed-key.outputs.key }}-${{ inputs.os }}
+      - name: prepare preserved Data seed
+        if: inputs.os == '27'
+        env:
+          INIT_DATA: ${{ inputs.init_data }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, urllib.request
+          inputs = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())['inputs']
+          path = pathlib.Path('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr')
+          url, digest = inputs.get('data_seed_url', ''), inputs.get('data_seed_sha256', '').lower()
+          if url:
+              print('::add-mask::' + url)
+              if not url.startswith('https://') or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+                  raise SystemExit('A seed URL requires HTTPS and its SHA-256')
+              with urllib.request.urlopen(url, timeout=120) as source:
+                  data = source.read(64 * 1024 * 1024 + 1)
+              if len(data) > 64 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
+                  raise SystemExit('Seed size or SHA-256 mismatch')
+              if path.exists() and path.read_bytes() != data:
+                  raise SystemExit('Saved seed differs; preserve and inspect it instead of replacing this installation')
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(data)
+          if not path.is_file() and os.environ['INIT_DATA'] != 'true':
+              raise SystemExit('No saved seed. Supply the ORIGINAL seed for an existing installation, or select init_data for a FIRST installation')
+          PY
+      - name: package
+        working-directory: device
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+          INIT_DATA: ${{ inputs.init_data }}
+          OS_PROFILE: ${{ inputs.os }}
+        run: |
+          args=(--os "$OS_PROFILE" --uefi ../uefi-sheng)
+          if [ "$OS_PROFILE" = 27 ] && [ "$INIT_DATA" = true ]; then
+            args+=(--init-data)
+          fi
+          scripts/package.sh "${args[@]}"
+      - uses: actions/cache/save@v4
+        if: always() && inputs.os == '27' && steps.data-cache.outputs.cache-hit != 'true' && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
+        with:
+          path: |
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/inputs.json
+          key: ${{ steps.seed-key.outputs.key }}-${{ inputs.os }}
+      - name: installation seed backup
+        if: always() && inputs.os == '27' && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: installation-seed-${{ inputs.os }}
+          retention-days: 1
+          path: |
+            UniXNU/out/sheng/*/*/runtime/data.dbr
+            UniXNU/out/sheng/*/*/runtime/inputs.json
+      - name: images
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ inputs.os }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            UniXNU/out/sheng/*/*/boot/boot.img
+            UniXNU/out/sheng/*/*/payload/payload.img
+            UniXNU/out/sheng/*/*/kernel/kernel.macho
+            UniXNU/out/sheng/*/*/package.manifest.json
