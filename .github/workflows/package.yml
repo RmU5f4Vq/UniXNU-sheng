@@ -173,6 +173,55 @@ jobs:
         run: |
           python3 scripts/extract-files.py
           python3 scripts/extract-files.py --check
+      - name: WCN7850 firmware
+        # build-wifi-userspace.py reads firmware/wcn7850/{amss.bin,m3.bin,board-2.bin} and stops
+        # with FileNotFoundError when they are absent. .gitignore keeps them out of the
+        # repository (firmware/wcn7850/*.bin), so a fresh checkout has only manifest.json and
+        # the runtime step fails before the kernel is ever built:
+        #   FileNotFoundError: .../device/firmware/wcn7850/amss.bin
+        # Unlike the Bluetooth inputs, whose manifest names a repository and commit and whose
+        # staging script can fetch them itself (stage-bluetooth-firmware.py --fetch), this
+        # manifest records no source: it only pins the digests of the firmware read back from
+        # the device. Take the same files from linux-firmware, whose ath12k WCN7850 hw2.0
+        # entries hash to exactly the bytes the manifest pins (verified against every digest
+        # below), at a fixed commit so a later linux-firmware update cannot change them.
+        working-directory: device
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, sys, urllib.request
+
+          base = ('https://gitlab.com/api/v4/projects/kernel-firmware%2Flinux-firmware'
+                  '/repository/files/ath12k%2FWCN7850%2Fhw2.0%2F{F}/raw?ref=575bbe3f83565d18caa73e9b9458f754dd286f48')
+          files = [
+              ('amss.bin', 6090816, '43aadfd3df887f27de74020273aee484bac6a31dd53068f91baf2a9b094d6a68'),
+              ('m3.bin', 299660, '0e72f44df7defc269fe92dcea25d4d409046c04b77d41c510c52879b3dfc1055'),
+              ('board-2.bin', 2431968, '6a98237c743d864773a547e81e23f0c6dc721dcd7331926bee7381e2152e00fd'),
+          ]
+          root = pathlib.Path('firmware/wcn7850')
+          root.mkdir(parents=True, exist_ok=True)
+          for name, size, digest in files:
+              target = root / name
+              if target.is_file():
+                  data = target.read_bytes()
+                  if len(data) == size and hashlib.sha256(data).hexdigest() == digest:
+                      print(f'{name}: already correct')
+                      continue
+                  raise SystemExit(f'{name}: present but differs from the pinned digest')
+              url = base.format(F=name)
+              for attempt in range(1, 4):
+                  try:
+                      with urllib.request.urlopen(url, timeout=180) as response:
+                          data = response.read()
+                      break
+                  except Exception as error:
+                      print(f'{name}: attempt {attempt} failed: {error}', file=sys.stderr)
+                      if attempt == 3:
+                          raise SystemExit(f'{name}: cannot download')
+              if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+                  raise SystemExit(f'{name}: downloaded bytes differ from firmware/wcn7850/manifest.json')
+              target.write_bytes(data)
+              print(f'{name}: {size} bytes, digest matches the manifest')
+          PY
       - name: patch weak defaults
         # archive-08 builds libShengSourceStorage.a, and the kernel link cannot leave a weak
         # import undefined. scripts/build-sheng-source-storage.py generates zero defaults for
