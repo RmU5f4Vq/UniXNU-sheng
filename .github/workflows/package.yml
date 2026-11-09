@@ -42,8 +42,14 @@ jobs:
           submodules: recursive
       - uses: actions/checkout@v4
         with:
-          repository: UniXNU/UniXNU
-          ref: 82b847c4ac3f68a57024b3082ffa3a03442defd9 # Wi-Fi runtime and Data firmware integration
+          # RmU5f4Vq/UniXNU: upstream a3663791 plus one commit (76e93f4a7e99) that
+          # adds "new file mode 100644" to
+          # patches/mesa/turnip-frame-diagnostics.patch. Without it git apply
+          # treats /dev/null as a literal path and the runtime step dies with
+          # "error: dev/null: No such file or directory". Pinned by commit so a
+          # later fork sync cannot silently drop the fix.
+          repository: RmU5f4Vq/UniXNU
+          ref: 76e93f4a7e99f1fc368192466c0544d154e1ea2a
           path: UniXNU
           submodules: recursive
       - uses: actions/checkout@v4
