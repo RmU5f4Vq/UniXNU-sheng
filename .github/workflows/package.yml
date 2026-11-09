@@ -165,6 +165,105 @@ jobs:
         run: |
           python3 scripts/extract-files.py
           python3 scripts/extract-files.py --check
+      - name: patch fileset reference retries
+        # archive-20 builds the RELEASE comparison kernel that XnuPrelink matches the packed kernel
+        # against. scripts/build-fileset-release-reference.py repairs the first link failure with a
+        # hard-coded stub prefix list
+        #   r'^\s+"(_(?:native_[a-z0-9_]+|boot_log_rounds|boot_cache_input_capture))"'
+        # plus one forced-exports sweep, then links once more. The 27 board patches call a board entry
+        # point the reference build never links (build-boot-progress supplies the launchd launch
+        # policy), so the second link still stops on it:
+        #   "_sheng_boot_watchdog_policy", referenced from:
+        #       _load_init_program in kern_exec.o
+        #       l_sheng_boot_watchdog_policy$auth_ptr$ia$20679 in kern_exec.o
+        # A board entry point behind an extra configuration (CONFIG_XNU_SHENG_PMGR selects
+        # sheng_pmgr_run in bsd_init) leaves that list the same way.
+        # Stub every symbol the linker reports as undefined and retry until the report is empty, so a
+        # later board patch cannot outgrow the list again. Idempotent; it stops on an unexpected
+        # upstream rewrite instead of guessing.
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+
+          path = Path('UniXNU/scripts/build-fileset-release-reference.py')
+          text = path.read_text()
+          if 'for attempt in range(1, 6)' in text and 'stubbed = set()' in text:
+              print('already patched')
+              raise SystemExit(0)
+          if 'stub_names = sorted(' not in text:
+              raise SystemExit(f'{path}: neither the retry loop nor the stub list is present; upstream rewrote the block')
+          start_marker = "    # The bring-up patch calls native hooks from the kernel core behind weak_import declarations; on arm64e\n"
+          end_marker = "    if result.returncode:\n        raise SystemExit(result.returncode)\n"
+          start = text.find(start_marker)
+          end = text.find(end_marker)
+          if start < 0 or end < 0:
+              raise SystemExit(f'{path}: stub block not found (start={start}, end={end})')
+          # the raw string starts on this line so the block keeps its own indentation
+          replacement = r'''    # The bring-up patch calls native hooks from the kernel core behind weak_import declarations; on arm64e
+              # the authenticated pointer of an undefined weak symbol fails the link. The private copy stubs them: this
+              # comparison kernel never runs, the prelink step reads its layout. Board patches add entry points of their
+              # own (the watchdog launch policy, the PMGR bridge) that the archives of this profile provide, and the
+              # reference build links none of those archives, so the stub set is every symbol the linker reports as
+              # undefined - retried until the report is empty - instead of a prefix list that a new board patch outgrows.
+              stubbed = set()
+              cleaned = False
+              result = None
+              for attempt in range(1, 6):
+                  build_log = (output / f'{mode}-build.log').read_text()
+                  undefined = {name for name in re.findall(r'^\s+"(_[A-Za-z0-9_.]+)", referenced from:', build_log, re.M)
+                               if name not in stubbed}
+                  if undefined:
+                      stubbed |= undefined
+                      (output / 'native-stubs.c').write_text(''.join(f'long {name[1:]};\n' for name in sorted(stubbed)))   # the linker names carry the leading underscore
+                      iphoneos = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
+                      subprocess.run(['xcrun', 'clang', '-arch', 'arm64e', '-mkernel', '-isysroot', iphoneos, '-c',
+                                      '-o', str(output / 'native-stubs.o'), str(output / 'native-stubs.c')], check=True)
+                      at = next(i for i, a in enumerate(args) if a.startswith('LD_KERNEL_ARCHIVES='))
+                      if 'native-stubs.o' not in args[at]:
+                          args[at] += f' -Wl,-force_load,{output}/native-stubs.o'
+                      print('reference link', attempt, 'stubbed', len(undefined), 'undefined symbols:',
+                            ' '.join(sorted(undefined)), flush=True)
+                  if not cleaned:
+                      # Forced exports the built objects cannot provide: remove them from this private copy and link again
+                      # (the symbols are absent from the comparison kernel either way; the first link can stop exactly there,
+                      # and its file list is what names the objects that were built).
+                      objects = linked_objects(output / f'{mode}-obj/RELEASE_ARM64_BCM2837', options.lto)
+                      objects += list(map(str, archives + forced))
+                      names = set()
+                      for i in range(0, len(objects), 100):
+                          listed = subprocess.run(['xcrun', 'nm', '-gUj', *objects[i:i + 100]], capture_output=True, text=True, check=True)
+                          names.update(symbol for symbol in listed.stdout.splitlines() if symbol.startswith('_') and ' ' not in symbol)
+                      removed = []
+                      for filename in ('Private.exports', 'Private.arm64.exports'):
+                          path = output / 'source/config' / filename
+                          lines = path.read_text().splitlines(keepends=True)
+                          rejected = {line.strip() for line in lines
+                                      if line.strip().startswith('_') and ':' not in line and not any(fnmatch.fnmatchcase(n, line.strip()) for n in names)}
+                          removed.extend(sorted(rejected))
+                          path.write_text(''.join(line for line in lines if line.strip() not in rejected))
+                      import json as _json
+                      record = output / 'omitted-unavailable-forced-exports.json'
+                      previous = _json.loads(record.read_text()) if record.exists() else []
+                      record.write_text(_json.dumps(sorted(set(previous + removed)), indent=2) + chr(10))
+                      print('removed', len(removed), 'unavailable forced exports; linking again', flush=True)
+                      cleaned = True
+                  elif not undefined:
+                      break   # a further link would fail exactly as the last one did
+                  with (output / f'{mode}-build.log').open('a') as log:
+                      result = subprocess.run(args, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT)
+                  print('RELEASE reference exit', result.returncode, 'log', output / f'{mode}-build.log', flush=True)
+                  if result.returncode == 0:
+                      break
+              if result is None or result.returncode:
+                  raise SystemExit(result.returncode if result is not None else 1)
+          '''
+          patched = text[:start] + replacement + text[end + len(end_marker):]
+          ast.parse(patched)
+          path.write_text(patched)
+          print('patched', path)
+          PY
+          grep -n 'for attempt in range' UniXNU/scripts/build-fileset-release-reference.py
       - name: patch ath12k sparse-checkout
         # tools/fetch-sources.py drives `git sparse-checkout add` with the path
         # list from tools/source-lock.json. That list mixes directories
