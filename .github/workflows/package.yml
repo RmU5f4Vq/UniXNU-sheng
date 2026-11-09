@@ -140,6 +140,37 @@ jobs:
         run: |
           python3 scripts/extract-files.py
           python3 scripts/extract-files.py --check
+      - name: patch ath12k sparse-checkout
+        # tools/fetch-sources.py calls `git sparse-checkout add` with the
+        # leading-slash patterns from tools/source-lock.json ("/drivers/...").
+        # Git >= 2.37 rejects those with
+        #   fatal: specify directories rather than patterns (no leading slash)
+        # and the ath12k fetch dies. The script already computes a stripped
+        # copy (`paths`) two lines earlier and uses it for the required-file
+        # checks; the add call is the only place still passing the raw list.
+        # Upstream UniXNU/Ath12kWifi carries the same line, so the fix is
+        # applied to the checkout instead of a fork.
+        run: |
+          file=device/drivers/Ath12kWifi/tools/fetch-sources.py
+          python3 - "$file" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          old = '"sparse-checkout", "add", *source["paths"]'
+          new = '"sparse-checkout", "add", *paths'
+          if old not in text:
+              if new in text:
+                  print('already patched')
+                  raise SystemExit(0)
+              raise SystemExit(f'{path}: neither the broken nor the fixed call is present')
+          if text.count(old) != 1:
+              raise SystemExit(f'{path}: expected one call, found {text.count(old)}')
+          path.write_text(text.replace(old, new))
+          print(f'patched {path}')
+          PY
+          python3 device/drivers/Ath12kWifi/tools/fetch-sources.py --check || true
       - name: package
         working-directory: device
         env:
