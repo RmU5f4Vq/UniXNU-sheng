@@ -128,6 +128,18 @@ jobs:
           if not path.is_file() and os.environ['INIT_DATA'] != 'true':
               raise SystemExit('No saved seed. Supply the ORIGINAL seed for an existing installation, or select init_data for a FIRST installation')
           PY
+      - name: proprietary files
+        # build-gop-legacy-display-27.py needs .cache/firmware/nanosic/MCU_Upgrade.bin
+        # for the keyboard controller's RAM image and stops with
+        # "nanosic/MCU_Upgrade.bin: run scripts/extract-files.py --section Keyboard"
+        # when it is absent. No preflight script fetches it, so the run does it
+        # here from the mirror proprietary-files.txt names (@fetch). The
+        # extractor checks every entry against its recorded SHA-256 and writes
+        # only files that match.
+        working-directory: device
+        run: |
+          python3 scripts/extract-files.py
+          python3 scripts/extract-files.py --check
       - name: package
         working-directory: device
         env:
