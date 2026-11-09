@@ -165,6 +165,130 @@ jobs:
         run: |
           python3 scripts/extract-files.py
           python3 scripts/extract-files.py --check
+      - name: patch source storage symbols
+        # archive-08 builds libShengSourceStorage.a from the device package. The engine checkout
+        # this workflow pins stops its iPadOS 27 branch at BootWatchdogPolicy.c, so WifiFirmware.c
+        # and BluetoothFirmware.c are never compiled and the board probes of
+        # libNativeLegacyDisplay.late.a cannot resolve their entry points at the kernel link:
+        #   "_sheng_bt_firmware_read", referenced from:
+        #       firmware(...) in libNativeLegacyDisplay.late.a[23](BluetoothProbe.o)
+        #   "_sheng_wifi_firmware_read", referenced from:
+        #       pFwGet(...) in libNativeLegacyDisplay.late.a[22](WifiProbe.o)
+        # Its weak-defaults generator reads one declaration per line, so a declaration that lists
+        # several weak imports after one type is skipped whole and the kernel link reports every
+        # name in it:
+        #   "_native_data_io_reads", referenced from: _compose in ... (BootLog.o)
+        # Upstream main carries the two sources; the multi-declarator split is in neither revision.
+        # Both edits are idempotent, and ast.parse checks the result before it is written.
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+
+          path = Path('UniXNU/scripts/build-sheng-source-storage.py')
+          text = path.read_text()
+          if 'WifiFirmware.c' in text and 'split_declarators' in text:
+              print('already patched')
+              raise SystemExit(0)
+
+          old_bsd = "    bsd_sources = {'BootWatchdogPolicy.c', 'BootDiagExport.c'}\n"
+          new_bsd = ("    bsd_sources = {'BootWatchdogPolicy.c', 'BootDiagExport.c',"
+                     " 'WifiFirmware.c', 'BluetoothFirmware.c'}\n")
+          if old_bsd not in text:
+              raise SystemExit(f'{path}: bsd_sources line changed upstream')
+          text = text.replace(old_bsd, new_bsd, 1)
+
+          old_append = "        sources.append(device_source('BootDiagExport.c'))\n"
+          new_append = (old_append +
+                        "        sources.append(device_source('WifiFirmware.c'))\n"
+                        "        sources.append(device_source('BluetoothFirmware.c'))\n")
+          if old_append not in text:
+              raise SystemExit(f'{path}: BootDiagExport append changed upstream')
+          text = text.replace(old_append, new_append, 1)
+
+          old_weak = r'''    import re
+              lines = []
+              for line in source.read_text().splitlines():
+                  line = line.strip()
+                  if not (line.startswith('extern ') and line.endswith('__attribute__((weak_import));')):
+                      continue
+                  decl = line[len('extern '):-len('__attribute__((weak_import));')].replace('__attribute__((weak_import))', '').strip()
+                  call = re.match(r'^(.*?[\s*])([A-Za-z_]\w*)\s*\((.*)\)$', decl)
+                  if call and '(*' not in decl.split(call.group(2))[0]:
+                      ret = call.group(1).strip()
+                      body = ('' if ret == 'void' else ' return -1;' if ret == 'int' else
+                              ' return "";' if ret.replace(' ', '') in ('constchar*', 'char*') else ' return 0;')
+                      lines.append(f'__attribute__((weak, visibility("hidden"))) {decl} {{{body} }}')
+                  else:
+                      lines.append(f'__attribute__((weak, visibility("hidden"))) {decl};')
+          '''
+          new_weak = r'''    import re
+
+              def split_declarators(text):
+                  """Split a declaration at its top-level commas, ignoring parameter lists."""
+                  parts, depth, current = [], 0, ''
+                  for char in text:
+                      if char in '([{':
+                          depth += 1
+                      elif char in ')]}':
+                          depth -= 1
+                      if char == ',' and not depth:
+                          parts.append(current.strip())
+                          current = ''
+                      else:
+                          current += char
+                  parts.append(current.strip())
+                  return [part for part in parts if part]
+
+              # Comments and preprocessor lines are dropped first: they sit between declarations and
+              # would hide the 'extern' that opens the next one, and they carry no semicolon.
+              text = re.sub(r'/\*.*?\*/', ' ', source.read_text(), flags=re.S)
+              statements, current = [], ''
+              for line in text.splitlines():
+                  line = re.sub(r'//.*$', ' ', line).strip()
+                  if not line or line.startswith('#'):
+                      continue
+                  if not current:
+                      if not line.startswith('extern '):
+                          continue
+                      current = line
+                  else:
+                      current += ' ' + line
+                  if current.endswith(';'):
+                      statements.append(current)
+                      current = ''
+              lines = []
+              # One declaration may list several declarators after a single type, e.g.
+              #   extern volatile uint64_t a __attribute__((weak_import)), b __attribute__((weak_import)),
+              # A per-line reader skips that whole declaration and the kernel link then reports every
+              # name in it, so each declaration is split at its top-level commas and every declarator
+              # expanded.
+              for statement in statements:
+                  if '__attribute__((weak_import))' not in statement:
+                      continue
+                  decl = statement[len('extern '):].replace('__attribute__((weak_import))', '').strip().rstrip(';').strip()
+                  parts = split_declarators(decl)
+                  head = re.match(r'^(.*?[\s*])([A-Za-z_]\w*)(\s*\(.*\))?$', parts[0])
+                  declarators = ([parts[0]] + [head.group(1) + part for part in parts[1:]]) if head else [decl]
+                  for declarator in declarators:
+                      call = re.match(r'^(.*?[\s*])([A-Za-z_]\w*)\s*\((.*)\)$', declarator)
+                      if call and '(*' not in declarator.split(call.group(2))[0]:
+                          ret = call.group(1).strip()
+                          body = ('' if ret == 'void' else ' return -1;' if ret == 'int' else
+                                  ' return "";' if ret.replace(' ', '') in ('constchar*', 'char*') else ' return 0;')
+                          lines.append(f'__attribute__((weak, visibility("hidden"))) {declarator} {{{body} }}')
+                      else:
+                          lines.append(f'__attribute__((weak, visibility("hidden"))) {declarator};')
+          '''
+
+          if old_weak not in text:
+              raise SystemExit(f'{path}: weak defaults block changed upstream')
+          text = text.replace(old_weak, new_weak, 1)
+          ast.parse(text)
+          path.write_text(text)
+          print('patched', path)
+          PY
+          grep -n "WifiFirmware.c\|split_declarators" UniXNU/scripts/build-sheng-source-storage.py
       - name: patch fileset reference retries
         # archive-20 builds the RELEASE comparison kernel that XnuPrelink matches the packed kernel
         # against. scripts/build-fileset-release-reference.py repairs the first link failure with a
