@@ -42,14 +42,22 @@ jobs:
           submodules: recursive
       - uses: actions/checkout@v4
         with:
-          # RmU5f4Vq/UniXNU: upstream a3663791 plus one commit (76e93f4a7e99) that
-          # adds "new file mode 100644" to
-          # patches/mesa/turnip-frame-diagnostics.patch. Without it git apply
-          # treats /dev/null as a literal path and the runtime step dies with
-          # "error: dev/null: No such file or directory". Pinned by commit so a
-          # later fork sync cannot silently drop the fix.
+          # RmU5f4Vq/UniXNU main (7d59ac2e): upstream 8ec13bb6 plus the one commit that
+          # adds "new file mode 100644" to patches/mesa/turnip-frame-diagnostics.patch.
+          # Upstream still ships that patch without the line (sha256 5eb8dda6 on
+          # UniXNU/UniXNU 95ad781292), so the fork stays the source; scripts/unixnu has
+          # no submodule fallback that could skip it.
+          # The pinned tree matters more than its scripts: it carries the current
+          # submodules. RamBlock 93dd9afc defines the whole native_data_io_* set that
+          # 4be2d7eb lacks, GopFramebuffer e47c1b8d, ArmCpu 696e0921, Adreno740
+          # 6fa7bae2 and kits/XnuPrelink c645d76b come with it. scripts/unixnu/components
+          # resolves a component to the checked-out submodule directory before it reads
+          # components.toml, so the gitlinks here decide what the kernel link sees.
+          # This is the tree the fork whose package run completes uses, and with it the
+          # kernel resolves those imports from real definitions instead of zero-valued
+          # weak defaults: the diagnostics keep their readings.
           repository: RmU5f4Vq/UniXNU
-          ref: 76e93f4a7e99f1fc368192466c0544d154e1ea2a
+          ref: 7d59ac2e92d9bf2033d9c201a63982833959ce57
           path: UniXNU
           submodules: recursive
       - uses: actions/checkout@v4
@@ -165,21 +173,22 @@ jobs:
         run: |
           python3 scripts/extract-files.py
           python3 scripts/extract-files.py --check
-      - name: patch source storage symbols
-        # archive-08 builds libShengSourceStorage.a from the device package. The engine checkout
-        # this workflow pins stops its iPadOS 27 branch at BootWatchdogPolicy.c, so WifiFirmware.c
-        # and BluetoothFirmware.c are never compiled and the board probes of
-        # libNativeLegacyDisplay.late.a cannot resolve their entry points at the kernel link:
-        #   "_sheng_bt_firmware_read", referenced from:
-        #       firmware(...) in libNativeLegacyDisplay.late.a[23](BluetoothProbe.o)
-        #   "_sheng_wifi_firmware_read", referenced from:
-        #       pFwGet(...) in libNativeLegacyDisplay.late.a[22](WifiProbe.o)
-        # Its weak-defaults generator reads one declaration per line, so a declaration that lists
-        # several weak imports after one type is skipped whole and the kernel link reports every
-        # name in it:
-        #   "_native_data_io_reads", referenced from: _compose in ... (BootLog.o)
-        # Upstream main carries the two sources; the multi-declarator split is in neither revision.
-        # Both edits are idempotent, and ast.parse checks the result before it is written.
+      - name: patch weak defaults
+        # archive-08 builds libShengSourceStorage.a, and the kernel link cannot leave a weak
+        # import undefined. scripts/build-sheng-source-storage.py generates zero defaults for
+        # BootLog.c only, and its generator reads one declaration per line:
+        #   if not (line.startswith('extern ') and line.endswith('__attribute__((weak_import));')):
+        # BootLog.c groups its imports, e.g.
+        #   extern volatile uint64_t native_data_io_reads __attribute__((weak_import)), native_data_io_read_bytes __attribute__((weak_import)),
+        # so those declarations produce no default at all and the link reports every name in
+        # them. With RamBlock 4be2d7eb pinned that was fatal (run #23); RamBlock 93dd9afc now
+        # defines the set, so this keeps the generator honest for the groups whose component
+        # is not built in - it must ship zero defaults for them, not nothing.
+        # The rework splits each declaration at its top-level commas (a comma inside a
+        # parameter list, an array subscript or a braces initialiser does not split) and keeps
+        # the original return conventions: int reports -1, a char pointer "", other scalars 0,
+        # functions void, everything else a zero definition with hidden visibility.
+        # Idempotent; ast.parse checks the result before it is written.
         run: |
           python3 - <<'PY'
           import ast
@@ -187,24 +196,11 @@ jobs:
 
           path = Path('UniXNU/scripts/build-sheng-source-storage.py')
           text = path.read_text()
-          if 'WifiFirmware.c' in text and 'split_declarators' in text:
+          if 'split_declarators' in text:
               print('already patched')
               raise SystemExit(0)
-
-          old_bsd = "    bsd_sources = {'BootWatchdogPolicy.c', 'BootDiagExport.c'}\n"
-          new_bsd = ("    bsd_sources = {'BootWatchdogPolicy.c', 'BootDiagExport.c',"
-                     " 'WifiFirmware.c', 'BluetoothFirmware.c'}\n")
-          if old_bsd not in text:
-              raise SystemExit(f'{path}: bsd_sources line changed upstream')
-          text = text.replace(old_bsd, new_bsd, 1)
-
-          old_append = "        sources.append(device_source('BootDiagExport.c'))\n"
-          new_append = (old_append +
-                        "        sources.append(device_source('WifiFirmware.c'))\n"
-                        "        sources.append(device_source('BluetoothFirmware.c'))\n")
-          if old_append not in text:
-              raise SystemExit(f'{path}: BootDiagExport append changed upstream')
-          text = text.replace(old_append, new_append, 1)
+          if "line.endswith('__attribute__((weak_import));')" not in text:
+              raise SystemExit(f'{path}: the weak-defaults loop changed upstream')
 
           old_weak = r'''    import re
               lines = []
@@ -288,7 +284,7 @@ jobs:
           path.write_text(text)
           print('patched', path)
           PY
-          grep -n "WifiFirmware.c\|split_declarators" UniXNU/scripts/build-sheng-source-storage.py
+          grep -n 'split_declarators' UniXNU/scripts/build-sheng-source-storage.py
       - name: patch fileset reference retries
         # archive-20 builds the RELEASE comparison kernel that XnuPrelink matches the packed kernel
         # against. scripts/build-fileset-release-reference.py repairs the first link failure with a
